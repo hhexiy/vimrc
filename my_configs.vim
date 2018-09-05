@@ -4,6 +4,7 @@ set tabstop=4
 set shiftwidth=4
 set autoindent
 set si
+set textwidth=0 wrapmargin=0
 
 syntax enable
 set background=dark
@@ -28,3 +29,4 @@ let g:syntastic_c_config_file = '.syntastic.config'
 let g:syntastic_cpp_config_file = '.syntastic.config'
 let g:syntastic_c_check_header = 1
 let g:syntastic_c_auto_refresh_includes = 1
+let g:syntastic_mode_map = {'mode': 'passive'}
