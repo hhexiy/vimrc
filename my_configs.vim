@@ -8,8 +8,6 @@ set textwidth=0 wrapmargin=0
 
 syntax enable
 set background=dark
-set t_Co=16
-let g:solarized_termcolors=256
 colorscheme solarized
 
 let java_mark_braces_in_parens_as_errors=1
