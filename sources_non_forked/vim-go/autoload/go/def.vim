@@ -1,260 +1,352 @@
-if !exists("g:go_godef_bin")
-	let g:go_godef_bin = "godef"
-endif
+" don't spam the user when Vim is started in Vi compatibility mode
+let s:cpo_save = &cpo
+set cpo&vim
 
-if go#vimproc#has_vimproc()
-	let s:vim_system = get(g:, 'gocomplete#system_function', 'vimproc#system2')
-else
-	let s:vim_system = get(g:, 'gocomplete#system_function', 'system')
-endif
+let s:go_stack = []
+let s:go_stack_level = 0
 
-fu! s:system(str, ...)
-	return call(s:vim_system, [a:str] + a:000)
-endf
+function! go#def#Jump(mode, type) abort
+  let l:fname = fnamemodify(expand("%"), ':p:gs?\\?/?')
 
-" modified and improved version of vim-godef
-function! go#def#Jump(...)
-	if !len(a:000)
-		let arg = "-o=" . go#util#OffsetCursor()
-	else
-		let arg = a:1
-	endif
+  " so guru right now is slow for some people. previously we were using
+  " godef which also has it's own quirks. But this issue come up so many
+  " times I've decided to support both. By default we still use guru as it
+  " covers all edge cases, but now anyone can switch to godef if they wish
+  let bin_name = go#config#DefMode()
+  if bin_name == 'godef'
+    let l:cmd = ['godef',
+          \ '-f=' . l:fname,
+          \ '-o=' . go#util#OffsetCursor(),
+          \ '-t']
 
-	let bin_path = go#path#CheckBinPath(g:go_godef_bin)
-	if empty(bin_path)
-		return
-	endif
-
-	let old_gopath = $GOPATH
-	let $GOPATH = go#path#Detect()
-
-	let fname = fnamemodify(expand("%"), ':p:gs?\\?/?')
-	let command = bin_path . " -t -f=" . shellescape(fname) . " -i " . shellescape(arg)
-
-	" get output of godef
-	let out = s:system(command, join(getbufline(bufnr('%'), 1, '$'), go#util#LineEnding()))
-
-	" First line is <file>:<line>:<col>
-	" Second line is <identifier><space><type>
-	let godefout=split(out, go#util#LineEnding())
-
-	" jump to it
-	call s:godefJump(godefout, "")
-	let $GOPATH = old_gopath
-endfunction
-
-
-function! go#def#JumpMode(mode)
-	let arg = "-o=" . go#util#OffsetCursor()
-
-	let bin_path = go#path#CheckBinPath(g:go_godef_bin)
-	if empty(bin_path)
-		return
-	endif
-
-	let old_gopath = $GOPATH
-	let $GOPATH = go#path#Detect()
-
-	let fname = fnamemodify(expand("%"), ':p:gs?\\?/?')
-	let command = bin_path . " -t -f=" . shellescape(fname) . " -i " . shellescape(arg)
-
-	" get output of godef
-	let out = s:system(command, join(getbufline(bufnr('%'), 1, '$'), go#util#LineEnding()))
-
-	" First line is <file>:<line>:<col>
-	" Second line is <identifier><space><type>
-	let godefout=split(out, go#util#LineEnding())
-
-	" jump to it
-	call s:godefJump(godefout, a:mode)
-	let $GOPATH = old_gopath
-endfunction
-
-
-function! s:getOffset()
-	return "-o=" . go#util#OffsetCursor()
-endfunction
-
-
-function! s:godefJump(out, mode)
-	let old_errorformat = &errorformat
-	let &errorformat = "%f:%l:%c"
-
-	" Location is the first line of godef output. Ideally in the proper format
-	" but it could also be an error
-	let location = a:out[0]
-
-	" Echo the godef error if we had one.
-	if location =~ 'godef: '
-		let gderr=substitute(location, go#util#LineEnding() . '$', '', '')
-        call go#util#EchoError(gderr)
-        return
-    endif
-
-    let parts = split(a:out[0], ':')
-
-    " parts[0] contains filename
-    let fileName = parts[0]
-
-    " Don't jump if it's the same identifier we just jumped to
-    if len(w:go_stack) > 0 && w:go_stack[w:go_stack_level-1]['ident'] == a:out[1] && w:go_stack[w:go_stack_level-1]['file'] == fileName
-        return
-    endif
-
-    " needed for restoring back user setting this is because there are two
-    " modes of switchbuf which we need based on the split mode
-    let old_switchbuf = &switchbuf
-
-    if a:mode == "tab"
-        let &switchbuf = "usetab"
-
-        if bufloaded(fileName) == 0
-            tab split
-        endif
-    elseif a:mode  == "split"
-        split
-    elseif a:mode == "vsplit"
-        vsplit
+    if &modified
+      let l:stdin_content = join(go#util#GetLines(), "\n")
+      call add(l:cmd, "-i")
+      let [l:out, l:err] = go#util#ExecInDir(l:cmd, l:stdin_content)
     else
-        " Don't jump in this window if it's been modified
-        if getbufvar(bufnr('%'), "&mod")
-            call go#util#EchoError("No write since last change")
-            return
-        endif
+      let [l:out, l:err] = go#util#ExecInDir(l:cmd)
+    endif
+  elseif bin_name == 'guru'
+    let cmd = [go#path#CheckBinPath(bin_name)]
+    let buildtags = go#config#BuildTags()
+    if buildtags isnot ''
+      let cmd += ['-tags', buildtags]
     endif
 
-    let stack_entry = {'line': line("."), 'col': col("."),
-                \'file': expand('%:p'), 'ident': a:out[1]}
+    let stdin_content = ""
 
-    " jump to file now
-    call s:goToFileLocation(location)
-    "
-    " Remove anything newer than the current position, just like basic
-    " vim tag support
-    if w:go_stack_level == 0
-        let w:go_stack = []
+    if &modified
+      let content = join(go#util#GetLines(), "\n")
+      let stdin_content = fname . "\n" . strlen(content) . "\n" . content
+      call add(cmd, "-modified")
+    endif
+
+    call extend(cmd, ["definition", fname . ':#' . go#util#OffsetCursor()])
+
+    if go#util#has_job()
+      let l:state = {}
+      let l:spawn_args = {
+            \ 'cmd': cmd,
+            \ 'complete': function('s:jump_to_declaration_cb', [a:mode, bin_name], l:state),
+            \ 'for': '_',
+            \ 'statustype': 'searching declaration',
+            \ }
+
+      if &modified
+        let l:spawn_args.input = stdin_content
+      endif
+
+      call s:def_job(spawn_args, l:state)
+      return
+    endif
+
+    if &modified
+      let [l:out, l:err] = go#util#ExecInDir(l:cmd, l:stdin_content)
     else
-        let w:go_stack = w:go_stack[0:w:go_stack_level-1]
+      let [l:out, l:err] = go#util#ExecInDir(l:cmd)
     endif
+  elseif bin_name == 'gopls'
+    let [l:line, l:col] = go#lsp#lsp#Position()
+    " delegate to gopls, with an empty job object and an exit status of 0
+    " (they're irrelevant for gopls).
+    if a:type
+      call go#lsp#TypeDef(l:fname, l:line, l:col, function('s:jump_to_declaration_cb', [a:mode, 'gopls', {}, 0]))
+    else
+      call go#lsp#Definition(l:fname, l:line, l:col, function('s:jump_to_declaration_cb', [a:mode, 'gopls', {}, 0]))
+    endif
+    return
+  else
+    call go#util#EchoError('go_def_mode value: '. bin_name .' is not valid. Valid values are: [godef, guru, gopls]')
+    return
+  endif
 
-    " increment the stack counter
-    let w:go_stack_level += 1
+  if l:err
+    call go#util#EchoError(out)
+    return
+  endif
 
-    " push it on to the jumpstack
-    call add(w:go_stack, stack_entry)
-
-    let &switchbuf = old_switchbuf
+  call go#def#jump_to_declaration(out, a:mode, bin_name)
 endfunction
 
-function! go#def#StackUI()
-    if len(w:go_stack) == 0
-        call go#util#EchoError("godef stack empty")
-        return
-    endif
+function! s:jump_to_declaration_cb(mode, bin_name, job, exit_status, data) abort dict
+  if a:exit_status != 0
+    return
+  endif
 
-    let stackOut = ['" <Up>,<Down>:navigate <Enter>:jump <Esc>,q:exit']
+  call go#def#jump_to_declaration(a:data[0], a:mode, a:bin_name)
 
-    let i = 0
-    while i < len(w:go_stack)
-        let entry = w:go_stack[i]
-        let prefix = ""
-        if i == w:go_stack_level
-            let prefix = ">"
+  " capture the active window so that callbacks for jobs, exit_cb and
+  " close_cb, and callbacks for gopls can return to it when a:mode caused a
+  " split.
+  let self.winid = win_getid(winnr())
+endfunction
+
+" go#def#jump_to_declaration parses out (expected to be
+" 'filename:line:col: message').
+function! go#def#jump_to_declaration(out, mode, bin_name) abort
+  let final_out = a:out
+  if a:bin_name == "godef"
+    " append the type information to the same line so it will be parsed
+    " correctly using guru's output format.
+    " This makes it compatible with guru output.
+    let final_out = join(split(a:out, '\n'), ':')
+  endif
+
+  " strip line ending
+  let out = split(final_out, go#util#LineEnding())[0]
+  if go#util#IsWin()
+    let parts = split(out, '\(^[a-zA-Z]\)\@<!:')
+  else
+    let parts = split(out, ':')
+  endif
+
+  if len(parts) == 0
+    call go#util#EchoError('go jump_to_declaration '. a:bin_name .' output is not valid.')
+    return
+  endif
+
+  let line = 1
+  let col = 1
+  let ident = 0
+  let filename = parts[0]
+  if len(parts) > 1
+    let line = parts[1]
+  endif
+  if len(parts) > 2
+    let col = parts[2]
+  endif
+  if len(parts) > 3
+    let ident = parts[3]
+  endif
+
+  " Remove anything newer than the current position, just like basic
+  " vim tag support
+  if s:go_stack_level == 0
+    let s:go_stack = []
+  else
+    let s:go_stack = s:go_stack[0:s:go_stack_level-1]
+  endif
+
+  " increment the stack counter
+  let s:go_stack_level += 1
+
+  " push it on to the jumpstack
+  let stack_entry = {'line': line("."), 'col': col("."), 'file': expand('%:p'), 'ident': ident}
+  call add(s:go_stack, stack_entry)
+
+  " needed for restoring back user setting this is because there are two
+  " modes of switchbuf which we need based on the split mode
+  let old_switchbuf = &switchbuf
+
+  normal! m'
+  if filename != fnamemodify(expand("%"), ':p:gs?\\?/?')
+    " jump to existing buffer if, 1. we have enabled it, 2. the buffer is loaded
+    " and 3. there is buffer window number we switch to
+    if go#config#DefReuseBuffer() && bufloaded(filename) != 0 && bufwinnr(filename) != -1
+      " jumpt to existing buffer if it exists
+      execute bufwinnr(filename) . 'wincmd w'
+    else
+      if &modified
+        let cmd = 'hide edit'
+      else
+        let cmd = 'edit'
+      endif
+
+      if a:mode == "tab"
+        let &switchbuf = "useopen,usetab,newtab"
+        if bufloaded(filename) == 0
+          tab split
         else
-            let prefix = " "
+           let cmd = 'sbuf'
         endif
-        call add(stackOut, printf("%s %d %s|%d col %d|%s", prefix, i+1, entry["file"], entry["line"], entry["col"], entry["ident"]))
-        let i += 1
-    endwhile
-    if w:go_stack_level == i
-        call add(stackOut, "> ")
-    endif
+      elseif a:mode == "split"
+        split
+      elseif a:mode == "vsplit"
+        vsplit
+      endif
 
-    call go#ui#OpenWindow("GoDef Stack", stackOut, "godefstack")
-    noremap <buffer> <silent> <CR>  :<C-U>call go#def#SelectStackEntry()<CR>
-    noremap <buffer> <silent> <Esc> :<C-U>call go#ui#CloseWindow()<CR>
-    noremap <buffer> <silent> q     :<C-U>call go#ui#CloseWindow()<CR>
+      " open the file and jump to line and column
+      exec cmd fnameescape(fnamemodify(filename, ':.'))
+    endif
+  endif
+  call cursor(line, col)
+
+  " also align the line to middle of the view
+  normal! zz
+
+  let &switchbuf = old_switchbuf
 endfunction
 
-function! go#def#StackPop(...)
-    if len(w:go_stack) == 0
-        call go#util#EchoError("godef stack empty")
-        return
-    endif
-    if w:go_stack_level == 0
-        call go#util#EchoError("at bottom of the godef stack")
-        return
-    endif
-    if !len(a:000)
-        let numPop = 1
+function! go#def#SelectStackEntry() abort
+  let target_window = go#ui#GetReturnWindow()
+  if empty(target_window)
+    let target_window = winnr()
+  endif
+
+  let highlighted_stack_entry = matchstr(getline("."), '^..\zs\(\d\+\)')
+  if !empty(highlighted_stack_entry)
+    execute target_window . "wincmd w"
+    call go#def#Stack(str2nr(highlighted_stack_entry))
+  endif
+
+  call go#ui#CloseWindow()
+endfunction
+
+function! go#def#StackUI() abort
+  if len(s:go_stack) == 0
+    call go#util#EchoError("godef stack empty")
+    return
+  endif
+
+  let stackOut = ['" <Up>,<Down>:navigate <Enter>:jump <Esc>,q:exit']
+
+  let i = 0
+  while i < len(s:go_stack)
+    let entry = s:go_stack[i]
+    let prefix = ""
+
+    if i == s:go_stack_level
+      let prefix = ">"
     else
-        let numPop = a:1
+      let prefix = " "
     endif
-    let newLevel = str2nr(w:go_stack_level) - str2nr(numPop)
-    call go#def#StackJump(newLevel + 1)
+
+    call add(stackOut, printf("%s %d %s|%d col %d|%s",
+          \ prefix, i+1, entry["file"], entry["line"], entry["col"], entry["ident"]))
+    let i += 1
+  endwhile
+
+  if s:go_stack_level == i
+    call add(stackOut, "> ")
+  endif
+
+  call go#ui#OpenWindow("GoDef Stack", stackOut, "godefstack")
+
+  noremap <buffer> <silent> <CR>  :<C-U>call go#def#SelectStackEntry()<CR>
+  noremap <buffer> <silent> <Esc> :<C-U>call go#ui#CloseWindow()<CR>
+  noremap <buffer> <silent> q     :<C-U>call go#ui#CloseWindow()<CR>
 endfunction
 
-function! go#def#StackJump(...)
-    if len(w:go_stack) == 0
-        call go#util#EchoError("godef stack empty")
-        return
-    endif
-	if !len(a:000)
-        " Display interactive stack
-        call go#def#StackUI()
-        return
-	else
-		let jumpTarget= a:1
-	endif
-
-    if jumpTarget !~ '^\d\+$'
-        if jumpTarget !~ '^\s*$'
-            call go#util#EchoError("location must be a number")
-        endif
-        return
-    endif
-
-    let jumpTarget=str2nr(jumpTarget) - 1
-    if jumpTarget >= 0 && jumpTarget < len(w:go_stack)
-        let w:go_stack_level = jumpTarget
-        let target = w:go_stack[w:go_stack_level]
-
-        " jump
-        call s:goToFileLocation(target["file"], target["line"], target["col"])
-    else
-        call go#util#EchoError("invalid godef stack location. Try :GoDefJump to see the list of valid entries")
-    endif
+function! go#def#StackClear(...) abort
+  let s:go_stack = []
+  let s:go_stack_level = 0
 endfunction
 
-function! s:goToFileLocation(...)
-	let old_errorformat = &errorformat
-	let &errorformat = "%f:%l:%c"
+function! go#def#StackPop(...) abort
+  if len(s:go_stack) == 0
+    call go#util#EchoError("godef stack empty")
+    return
+  endif
 
-    " put the error format into location list so we can jump automatically to
-    " it
-    if a:0 == 3
-        lgetexpr printf("%s:%s:%s", a:1, a:2, a:3)
-    elseif a:0 == 1
-        lgetexpr a:1
-    else
-        lgetexpr ""
-    endif
+  if s:go_stack_level == 0
+    call go#util#EchoError("at bottom of the godef stack")
+    return
+  endif
 
-    sil ll 1
-    normal zz
+  if !len(a:000)
+    let numPop = 1
+  else
+    let numPop = a:1
+  endif
 
-    let &errorformat = old_errorformat
+  let newLevel = str2nr(s:go_stack_level) - str2nr(numPop)
+  call go#def#Stack(newLevel + 1)
 endfunction
 
-function! go#def#SelectStackEntry()
-    let target_window = go#ui#GetReturnWindow()
-    if empty(target_window)
-        let target_window = winnr()
+function! go#def#Stack(...) abort
+  if len(s:go_stack) == 0
+    call go#util#EchoError("godef stack empty")
+    return
+  endif
+
+  if !len(a:000)
+    " Display interactive stack
+    call go#def#StackUI()
+    return
+  else
+    let jumpTarget = a:1
+  endif
+
+  if jumpTarget !~ '^\d\+$'
+    if jumpTarget !~ '^\s*$'
+      call go#util#EchoError("location must be a number")
     endif
-    let highlighted_stack_entry = matchstr(getline("."), '^..\zs\(\d\+\)')
-    if !empty(highlighted_stack_entry)
-        execute target_window . "wincmd w"
-        call go#def#StackJump(str2nr(highlighted_stack_entry))
+    return
+  endif
+
+  let jumpTarget = str2nr(jumpTarget) - 1
+
+  if jumpTarget >= 0 && jumpTarget < len(s:go_stack)
+    let s:go_stack_level = jumpTarget
+    let target = s:go_stack[s:go_stack_level]
+
+    " jump
+    if expand('%:p') != target["file"]
+      if &modified
+        exec 'hide edit' target["file"]
+      else
+        exec 'edit' target["file"]
+      endif
     endif
-    call go#ui#CloseWindow()
+    call cursor(target["line"], target["col"])
+    normal! zz
+  else
+    call go#util#EchoError("invalid location. Try :GoDefStack to see the list of valid entries")
+  endif
 endfunction
+
+function s:def_job(args, state) abort
+  let l:start_options = go#job#Options(a:args)
+
+  let l:state = a:state
+  function! s:exit_cb(next, job, exitval) dict
+    call call(a:next, [a:job, a:exitval])
+    if has_key(self, 'winid')
+      call win_gotoid(self.winid)
+    endif
+  endfunction
+  let l:start_options.exit_cb = funcref('s:exit_cb', [l:start_options.exit_cb], l:state)
+
+  function! s:close_cb(next, ch) dict
+    call call(a:next, [a:ch])
+    if has_key(self, 'winid')
+      call win_gotoid(self.winid)
+    endif
+  endfunction
+  let l:start_options.close_cb = funcref('s:close_cb', [l:start_options.close_cb], l:state)
+
+  if &modified
+    let l:tmpname = tempname()
+    call writefile(split(a:args.input, "\n"), l:tmpname, "b")
+    let l:start_options.in_io = "file"
+    let l:start_options.in_name = l:tmpname
+  endif
+
+  call go#job#Start(a:args.cmd, l:start_options)
+endfunction
+
+" restore Vi compatibility settings
+let &cpo = s:cpo_save
+unlet s:cpo_save
+
+" vim: sw=2 ts=2 et
